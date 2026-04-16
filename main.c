@@ -287,14 +287,56 @@ static double compute_dt(const Solver *s) {
     return dt;
 }
 
-static void advance_euler(Solver *s, double dt) {
+static void advance_ssprk3(Solver *s, double dt) {
+    const size_t n = (size_t)s->ncell * NVAR;
+    double *u0 = (double *)malloc(n * sizeof(double));
+    double *u1 = (double *)malloc(n * sizeof(double));
+    double *u2 = (double *)malloc(n * sizeof(double));
+    if (!u0 || !u1 || !u2) {
+        fprintf(stderr, "SSPRK3 temporary allocation failure\n");
+        free(u0); free(u1); free(u2);
+        exit(1);
+    }
+
+    memcpy(u0, s->u, n * sizeof(double));
+
+    /* Stage 1: U1 = U0 + dt * L(U0) */
     compute_rhs(s);
     for (int c = 0; c < s->ncell; ++c) {
         for (int m = 0; m < NVAR; ++m) {
-            s->u[c * NVAR + m] += dt * s->rhs[c * NVAR + m] / s->vol[c];
+            const size_t q = (size_t)c * NVAR + (size_t)m;
+            u1[q] = u0[q] + dt * s->rhs[q] / s->vol[c];
         }
-        s->u[c * NVAR + 0] = clamp_min(s->u[c * NVAR + 0], 1e-8);
+        u1[(size_t)c * NVAR] = clamp_min(u1[(size_t)c * NVAR], 1e-8);
     }
+    memcpy(s->u, u1, n * sizeof(double));
+
+    /* Stage 2: U2 = 3/4 U0 + 1/4 (U1 + dt * L(U1)) */
+    compute_rhs(s);
+    for (int c = 0; c < s->ncell; ++c) {
+        for (int m = 0; m < NVAR; ++m) {
+            const size_t q = (size_t)c * NVAR + (size_t)m;
+            const double predictor = u1[q] + dt * s->rhs[q] / s->vol[c];
+            u2[q] = 0.75 * u0[q] + 0.25 * predictor;
+        }
+        u2[(size_t)c * NVAR] = clamp_min(u2[(size_t)c * NVAR], 1e-8);
+    }
+    memcpy(s->u, u2, n * sizeof(double));
+
+    /* Stage 3: U^{n+1} = 1/3 U0 + 2/3 (U2 + dt * L(U2)) */
+    compute_rhs(s);
+    for (int c = 0; c < s->ncell; ++c) {
+        for (int m = 0; m < NVAR; ++m) {
+            const size_t q = (size_t)c * NVAR + (size_t)m;
+            const double predictor = u2[q] + dt * s->rhs[q] / s->vol[c];
+            s->u[q] = (1.0 / 3.0) * u0[q] + (2.0 / 3.0) * predictor;
+        }
+        s->u[(size_t)c * NVAR] = clamp_min(s->u[(size_t)c * NVAR], 1e-8);
+    }
+
+    free(u0);
+    free(u1);
+    free(u2);
 }
 
 int main(void) {
@@ -319,7 +361,7 @@ int main(void) {
     while (t < s.t_final) {
         double dt = compute_dt(&s);
         if (t + dt > s.t_final) dt = s.t_final - t;
-        advance_euler(&s, dt);
+        advance_ssprk3(&s, dt);
         t += dt;
         step++;
         if (step % 25 == 0 || t >= s.t_final) {
