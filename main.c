@@ -24,6 +24,7 @@ typedef struct {
     double gamma;
     double mu;      /* dynamic viscosity */
     double pr;      /* Prandtl */
+    double c_ip;    /* interior penalty coefficient */
     double cfl;
     double t_final;
     double warp;    /* warp amplitude for curvilinear map */
@@ -34,6 +35,12 @@ typedef struct {
 
     double *u;                 /* conserved vars, size ncell*NVAR */
     double *rhs;               /* residual */
+
+    /* primitive gradients for viscous term (du_i/dx_j and dT/dx_j) */
+    double *gu;                /* size ncell*3 */
+    double *gv;                /* size ncell*3 */
+    double *gw;                /* size ncell*3 */
+    double *gT;                /* size ncell*3 */
 } Solver;
 
 static inline int idx3(const Solver *s, int i, int j, int k) {
@@ -71,8 +78,13 @@ static void alloc_solver(Solver *s) {
     s->dz = (double *)calloc(n, sizeof(double));
     s->u = (double *)calloc(n * NVAR, sizeof(double));
     s->rhs = (double *)calloc(n * NVAR, sizeof(double));
+    s->gu = (double *)calloc(n * 3, sizeof(double));
+    s->gv = (double *)calloc(n * 3, sizeof(double));
+    s->gw = (double *)calloc(n * 3, sizeof(double));
+    s->gT = (double *)calloc(n * 3, sizeof(double));
 
-    if (!s->xc || !s->yc || !s->zc || !s->vol || !s->dx || !s->dy || !s->dz || !s->u || !s->rhs) {
+    if (!s->xc || !s->yc || !s->zc || !s->vol || !s->dx || !s->dy || !s->dz ||
+        !s->u || !s->rhs || !s->gu || !s->gv || !s->gw || !s->gT) {
         fprintf(stderr, "Allocation failure\n");
         exit(1);
     }
@@ -82,6 +94,7 @@ static void free_solver(Solver *s) {
     free(s->xc); free(s->yc); free(s->zc);
     free(s->vol); free(s->dx); free(s->dy); free(s->dz);
     free(s->u); free(s->rhs);
+    free(s->gu); free(s->gv); free(s->gw); free(s->gT);
 }
 
 static void build_mesh(Solver *s) {
@@ -169,6 +182,111 @@ static void numerical_flux_rusanov(const Solver *s, const double UL[NVAR], const
     }
 }
 
+static void compute_primitive_gradients(Solver *s) {
+    const int ncell = s->ncell;
+    double *uu = (double *)malloc((size_t)ncell * sizeof(double));
+    double *vv = (double *)malloc((size_t)ncell * sizeof(double));
+    double *ww = (double *)malloc((size_t)ncell * sizeof(double));
+    double *TT = (double *)malloc((size_t)ncell * sizeof(double));
+    if (!uu || !vv || !ww || !TT) {
+        fprintf(stderr, "Gradient temporary allocation failure\n");
+        free(uu); free(vv); free(ww); free(TT);
+        exit(1);
+    }
+
+    for (int c = 0; c < ncell; ++c) {
+        double rho, u, v, w, p, T, a;
+        cons_to_prim(s, &s->u[c * NVAR], &rho, &u, &v, &w, &p, &T, &a);
+        uu[c] = u;
+        vv[c] = v;
+        ww[c] = w;
+        TT[c] = T;
+    }
+
+    for (int k = 0; k < s->nz; ++k) {
+        for (int j = 0; j < s->ny; ++j) {
+            for (int i = 0; i < s->nx; ++i) {
+                const int c = idx3(s, i, j, k);
+                const int ip = idx3(s, (i + 1) % s->nx, j, k);
+                const int im = idx3(s, (i - 1 + s->nx) % s->nx, j, k);
+                const int jp = idx3(s, i, (j + 1) % s->ny, k);
+                const int jm = idx3(s, i, (j - 1 + s->ny) % s->ny, k);
+                const int kp = idx3(s, i, j, (k + 1) % s->nz);
+                const int km = idx3(s, i, j, (k - 1 + s->nz) % s->nz);
+
+                const double dxm = 0.5 * (s->dx[c] + s->dx[im]);
+                const double dxp = 0.5 * (s->dx[c] + s->dx[ip]);
+                const double dym = 0.5 * (s->dy[c] + s->dy[jm]);
+                const double dyp = 0.5 * (s->dy[c] + s->dy[jp]);
+                const double dzm = 0.5 * (s->dz[c] + s->dz[km]);
+                const double dzp = 0.5 * (s->dz[c] + s->dz[kp]);
+
+                const double denomx = clamp_min(dxm + dxp, 1e-12);
+                const double denomy = clamp_min(dym + dyp, 1e-12);
+                const double denomz = clamp_min(dzm + dzp, 1e-12);
+
+                s->gu[c * 3 + 0] = (uu[ip] - uu[im]) / denomx;
+                s->gu[c * 3 + 1] = (uu[jp] - uu[jm]) / denomy;
+                s->gu[c * 3 + 2] = (uu[kp] - uu[km]) / denomz;
+
+                s->gv[c * 3 + 0] = (vv[ip] - vv[im]) / denomx;
+                s->gv[c * 3 + 1] = (vv[jp] - vv[jm]) / denomy;
+                s->gv[c * 3 + 2] = (vv[kp] - vv[km]) / denomz;
+
+                s->gw[c * 3 + 0] = (ww[ip] - ww[im]) / denomx;
+                s->gw[c * 3 + 1] = (ww[jp] - ww[jm]) / denomy;
+                s->gw[c * 3 + 2] = (ww[kp] - ww[km]) / denomz;
+
+                s->gT[c * 3 + 0] = (TT[ip] - TT[im]) / denomx;
+                s->gT[c * 3 + 1] = (TT[jp] - TT[jm]) / denomy;
+                s->gT[c * 3 + 2] = (TT[kp] - TT[km]) / denomz;
+            }
+        }
+    }
+
+    free(uu);
+    free(vv);
+    free(ww);
+    free(TT);
+}
+
+static void viscous_flux_n(const Solver *s, int c, const double n[3], double Fvn[NVAR]) {
+    double rho, u, v, w, p, T, a;
+    cons_to_prim(s, &s->u[c * NVAR], &rho, &u, &v, &w, &p, &T, &a);
+    (void)p; (void)a;
+
+    const double du_dx = s->gu[c * 3 + 0], du_dy = s->gu[c * 3 + 1], du_dz = s->gu[c * 3 + 2];
+    const double dv_dx = s->gv[c * 3 + 0], dv_dy = s->gv[c * 3 + 1], dv_dz = s->gv[c * 3 + 2];
+    const double dw_dx = s->gw[c * 3 + 0], dw_dy = s->gw[c * 3 + 1], dw_dz = s->gw[c * 3 + 2];
+    const double dT_dx = s->gT[c * 3 + 0], dT_dy = s->gT[c * 3 + 1], dT_dz = s->gT[c * 3 + 2];
+
+    const double div_u = du_dx + dv_dy + dw_dz;
+    const double mu = s->mu;
+    const double kappa = mu * s->gamma / ((s->gamma - 1.0) * clamp_min(s->pr, 1e-12));
+
+    const double tau_xx = mu * (2.0 * du_dx - (2.0 / 3.0) * div_u);
+    const double tau_yy = mu * (2.0 * dv_dy - (2.0 / 3.0) * div_u);
+    const double tau_zz = mu * (2.0 * dw_dz - (2.0 / 3.0) * div_u);
+    const double tau_xy = mu * (du_dy + dv_dx);
+    const double tau_xz = mu * (du_dz + dw_dx);
+    const double tau_yz = mu * (dv_dz + dw_dy);
+
+    const double qx = -kappa * dT_dx;
+    const double qy = -kappa * dT_dy;
+    const double qz = -kappa * dT_dz;
+
+    const double tx_n = tau_xx * n[0] + tau_xy * n[1] + tau_xz * n[2];
+    const double ty_n = tau_xy * n[0] + tau_yy * n[1] + tau_yz * n[2];
+    const double tz_n = tau_xz * n[0] + tau_yz * n[1] + tau_zz * n[2];
+    const double qn = qx * n[0] + qy * n[1] + qz * n[2];
+
+    Fvn[0] = 0.0;
+    Fvn[1] = tx_n;
+    Fvn[2] = ty_n;
+    Fvn[3] = tz_n;
+    Fvn[4] = u * tx_n + v * ty_n + w * tz_n - qn;
+}
+
 static void initialize_ic(Solver *s) {
     for (int c = 0; c < s->ncell; ++c) {
         const double x = s->xc[c], y = s->yc[c], z = s->zc[c];
@@ -187,21 +305,32 @@ static void initialize_ic(Solver *s) {
     }
 }
 
-static void add_face_flux(Solver *s, int cL, int cR, const double nL[3], double area) {
-    double UL[NVAR], UR[NVAR], Fhat[NVAR];
+static void add_face_flux(Solver *s, int cL, int cR, const double nL[3], double area, double hL, double hR) {
+    double UL[NVAR], UR[NVAR], Fhat[NVAR], FvL[NVAR], FvR[NVAR], FvHat[NVAR];
     memcpy(UL, &s->u[cL * NVAR], sizeof(UL));
     memcpy(UR, &s->u[cR * NVAR], sizeof(UR));
 
     numerical_flux_rusanov(s, UL, UR, nL, Fhat);
+    viscous_flux_n(s, cL, nL, FvL);
+    viscous_flux_n(s, cR, nL, FvR);
+
+    const double h = 0.5 * (hL + hR);
+    const double tau = s->c_ip * s->mu / clamp_min(h, 1e-12);
+    for (int m = 0; m < NVAR; ++m) {
+        FvHat[m] = 0.5 * (FvL[m] + FvR[m]) - tau * (UR[m] - UL[m]);
+    }
+    FvHat[0] = 0.0; /* no diffusive mass flux */
 
     for (int m = 0; m < NVAR; ++m) {
-        s->rhs[cL * NVAR + m] -= Fhat[m] * area;
-        s->rhs[cR * NVAR + m] += Fhat[m] * area;
+        const double Ftotal = Fhat[m] - FvHat[m];
+        s->rhs[cL * NVAR + m] -= Ftotal * area;
+        s->rhs[cR * NVAR + m] += Ftotal * area;
     }
 }
 
 static void compute_rhs(Solver *s) {
     memset(s->rhs, 0, (size_t)s->ncell * NVAR * sizeof(double));
+    compute_primitive_gradients(s);
 
     /* periodic interfaces in x-direction */
     for (int k = 0; k < s->nz; ++k) {
@@ -212,7 +341,7 @@ static void compute_rhs(Solver *s) {
                 int cR = idx3(s, iR, j, k);
                 const double n[3] = {1.0, 0.0, 0.0};
                 const double area = 0.5 * (s->dy[cL] * s->dz[cL] + s->dy[cR] * s->dz[cR]);
-                add_face_flux(s, cL, cR, n, area);
+                add_face_flux(s, cL, cR, n, area, s->dx[cL], s->dx[cR]);
             }
         }
     }
@@ -226,7 +355,7 @@ static void compute_rhs(Solver *s) {
                 int cR = idx3(s, i, jR, k);
                 const double n[3] = {0.0, 1.0, 0.0};
                 const double area = 0.5 * (s->dx[cL] * s->dz[cL] + s->dx[cR] * s->dz[cR]);
-                add_face_flux(s, cL, cR, n, area);
+                add_face_flux(s, cL, cR, n, area, s->dy[cL], s->dy[cR]);
             }
         }
     }
@@ -240,34 +369,7 @@ static void compute_rhs(Solver *s) {
                 int cR = idx3(s, i, j, kR);
                 const double n[3] = {0.0, 0.0, 1.0};
                 const double area = 0.5 * (s->dx[cL] * s->dy[cL] + s->dx[cR] * s->dy[cR]);
-                add_face_flux(s, cL, cR, n, area);
-            }
-        }
-    }
-
-    /* simple viscous regularization (Laplacian-like on momentum and energy) */
-    for (int k = 0; k < s->nz; ++k) {
-        for (int j = 0; j < s->ny; ++j) {
-            for (int i = 0; i < s->nx; ++i) {
-                const int c = idx3(s, i, j, k);
-                const int ip = idx3(s, (i + 1) % s->nx, j, k);
-                const int im = idx3(s, (i - 1 + s->nx) % s->nx, j, k);
-                const int jp = idx3(s, i, (j + 1) % s->ny, k);
-                const int jm = idx3(s, i, (j - 1 + s->ny) % s->ny, k);
-                const int kp = idx3(s, i, j, (k + 1) % s->nz);
-                const int km = idx3(s, i, j, (k - 1 + s->nz) % s->nz);
-
-                const double hx2 = s->dx[c] * s->dx[c];
-                const double hy2 = s->dy[c] * s->dy[c];
-                const double hz2 = s->dz[c] * s->dz[c];
-
-                for (int m = 1; m < NVAR; ++m) {
-                    const double uc = s->u[c * NVAR + m];
-                    const double lap = (s->u[ip * NVAR + m] - 2.0 * uc + s->u[im * NVAR + m]) / hx2
-                                     + (s->u[jp * NVAR + m] - 2.0 * uc + s->u[jm * NVAR + m]) / hy2
-                                     + (s->u[kp * NVAR + m] - 2.0 * uc + s->u[km * NVAR + m]) / hz2;
-                    s->rhs[c * NVAR + m] += s->mu * lap * s->vol[c];
-                }
+                add_face_flux(s, cL, cR, n, area, s->dz[cL], s->dz[cR]);
             }
         }
     }
@@ -348,6 +450,7 @@ int main(void) {
     s.gamma = 1.4;
     s.mu = 2e-4;
     s.pr = 0.72;
+    s.c_ip = 2.0;
     s.cfl = 0.25;
     s.t_final = 0.2;
     s.warp = 0.08;
