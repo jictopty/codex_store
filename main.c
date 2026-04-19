@@ -56,6 +56,7 @@ typedef struct {
     int gnx;                    /* global x-cells */
     int i_start;                /* global x offset for this rank */
     int rank, nranks;
+    int p_order;                /* requested polynomial order */
     double gamma;
     double mu;      /* dynamic viscosity */
     double pr;      /* Prandtl */
@@ -119,42 +120,6 @@ static void exchange_x_plane_scalar(const Solver *s, const double *field, double
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     MPI_Sendrecv(send_right, plane_n, MPI_DOUBLE, right, 20,
                  left_plane, plane_n, MPI_DOUBLE, left, 20,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-    free(send_left);
-    free(send_right);
-}
-
-static void exchange_x_plane_cons(const Solver *s, double *left_plane, double *right_plane) {
-    const int left = (s->rank - 1 + s->nranks) % s->nranks;
-    const int right = (s->rank + 1) % s->nranks;
-    const int plane_n = s->ny * s->nz * NVAR;
-    double *send_left = (double *)malloc((size_t)plane_n * sizeof(double));
-    double *send_right = (double *)malloc((size_t)plane_n * sizeof(double));
-    if (!send_left || !send_right) {
-        fprintf(stderr, "MPI conservative plane allocation failure\n");
-        free(send_left); free(send_right);
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-
-    int q = 0;
-    for (int k = 0; k < s->nz; ++k) {
-        for (int j = 0; j < s->ny; ++j) {
-            const int cL = idx3(s, 0, j, k);
-            const int cR = idx3(s, s->nx - 1, j, k);
-            for (int m = 0; m < NVAR; ++m) {
-                send_left[q + m] = s->u[cL * NVAR + m];
-                send_right[q + m] = s->u[cR * NVAR + m];
-            }
-            q += NVAR;
-        }
-    }
-
-    MPI_Sendrecv(send_left, plane_n, MPI_DOUBLE, left, 30,
-                 right_plane, plane_n, MPI_DOUBLE, right, 30,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    MPI_Sendrecv(send_right, plane_n, MPI_DOUBLE, right, 40,
-                 left_plane, plane_n, MPI_DOUBLE, left, 40,
                  MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
     free(send_left);
@@ -258,6 +223,39 @@ static void cons_to_prim(const Solver *s, const double U[NVAR],
     *p = clamp_min(*p, 1e-10);
     *T = *p / *rho;
     *a = sqrt(s->gamma * (*p) / (*rho));
+}
+
+static void prim_to_cons(const Solver *s, double rho, double u, double v, double w, double p, double U[NVAR]) {
+    rho = clamp_min(rho, 1e-10);
+    p = clamp_min(p, 1e-10);
+    const double E = p / ((s->gamma - 1.0) * rho) + 0.5 * (u * u + v * v + w * w);
+    U[0] = rho;
+    U[1] = rho * u;
+    U[2] = rho * v;
+    U[3] = rho * w;
+    U[4] = rho * E;
+}
+
+static void reconstruct_face_state(const Solver *s, int c, const double n[3], double h, int side, double Uface[NVAR]) {
+    double rho, u, v, w, p, T, a;
+    cons_to_prim(s, &s->u[c * NVAR], &rho, &u, &v, &w, &p, &T, &a);
+    (void)a;
+
+    const double alpha = (s->p_order <= 0) ? 0.0 : 1.0;
+    const double ds = 0.5 * h * (double)side;
+    const double dr = 0.0; /* keep density piecewise constant for robustness */
+    const double du = alpha * (s->gu[c * 3 + 0] * n[0] + s->gu[c * 3 + 1] * n[1] + s->gu[c * 3 + 2] * n[2]) * ds;
+    const double dv = alpha * (s->gv[c * 3 + 0] * n[0] + s->gv[c * 3 + 1] * n[1] + s->gv[c * 3 + 2] * n[2]) * ds;
+    const double dw = alpha * (s->gw[c * 3 + 0] * n[0] + s->gw[c * 3 + 1] * n[1] + s->gw[c * 3 + 2] * n[2]) * ds;
+    const double dT = alpha * (s->gT[c * 3 + 0] * n[0] + s->gT[c * 3 + 1] * n[1] + s->gT[c * 3 + 2] * n[2]) * ds;
+
+    const double rho_f = clamp_min(rho + dr, 1e-10);
+    const double u_f = u + du;
+    const double v_f = v + dv;
+    const double w_f = w + dw;
+    const double T_f = clamp_min(T + dT, 1e-10);
+    const double p_f = clamp_min(rho_f * T_f, 1e-10);
+    prim_to_cons(s, rho_f, u_f, v_f, w_f, p_f, Uface);
 }
 
 static void flux_inviscid_n(const Solver *s, const double U[NVAR], const double n[3], double Fn[NVAR]) {
@@ -451,15 +449,16 @@ static void initialize_ic(Solver *s) {
 
 static void add_face_flux(Solver *s, int cL, int cR, const double nL[3], double area, double hL, double hR) {
     double UL[NVAR], UR[NVAR], Fhat[NVAR], FvL[NVAR], FvR[NVAR], FvHat[NVAR];
-    memcpy(UL, &s->u[cL * NVAR], sizeof(UL));
-    memcpy(UR, &s->u[cR * NVAR], sizeof(UR));
+    reconstruct_face_state(s, cL, nL, hL, +1, UL);
+    reconstruct_face_state(s, cR, nL, hR, -1, UR);
 
     numerical_flux_rusanov(s, UL, UR, nL, Fhat);
     viscous_flux_n(s, cL, nL, FvL);
     viscous_flux_n(s, cR, nL, FvR);
 
     const double h = 0.5 * (hL + hR);
-    const double tau = s->c_ip * s->mu / clamp_min(h, 1e-12);
+    const double pscale = (double)(s->p_order + 1) * (double)(s->p_order + 1);
+    const double tau = s->c_ip * pscale * s->mu / clamp_min(h, 1e-12);
     for (int m = 0; m < NVAR; ++m) {
         FvHat[m] = 0.5 * (FvL[m] + FvR[m]) - tau * (UR[m] - UL[m]);
     }
@@ -475,12 +474,13 @@ static void add_face_flux(Solver *s, int cL, int cR, const double nL[3], double 
 static void add_face_flux_remote(Solver *s, int cL, const double UR[NVAR], const double FvR[NVAR],
                                  const double nL[3], double area, double hL, double hR) {
     double UL[NVAR], Fhat[NVAR], FvL[NVAR], FvHat[NVAR];
-    memcpy(UL, &s->u[cL * NVAR], sizeof(UL));
+    reconstruct_face_state(s, cL, nL, hL, +1, UL);
     numerical_flux_rusanov(s, UL, UR, nL, Fhat);
     viscous_flux_n(s, cL, nL, FvL);
 
     const double h = 0.5 * (hL + hR);
-    const double tau = s->c_ip * s->mu / clamp_min(h, 1e-12);
+    const double pscale = (double)(s->p_order + 1) * (double)(s->p_order + 1);
+    const double tau = s->c_ip * pscale * s->mu / clamp_min(h, 1e-12);
     for (int m = 0; m < NVAR; ++m) {
         FvHat[m] = 0.5 * (FvL[m] + FvR[m]) - tau * (UR[m] - UL[m]);
     }
@@ -512,16 +512,14 @@ static void compute_rhs(Solver *s) {
 
     {
         const int plane_n = s->ny * s->nz;
-        double *u_left = (double *)malloc((size_t)plane_n * NVAR * sizeof(double));
         double *u_right = (double *)malloc((size_t)plane_n * NVAR * sizeof(double));
+        double *send_left_face = (double *)malloc((size_t)plane_n * NVAR * sizeof(double));
         double *fv_left = (double *)malloc((size_t)plane_n * NVAR * sizeof(double));
         double *fv_right = (double *)malloc((size_t)plane_n * NVAR * sizeof(double));
-        if (!u_left || !u_right || !fv_left || !fv_right) {
+        if (!u_right || !send_left_face || !fv_left || !fv_right) {
             fprintf(stderr, "Boundary plane allocation failure\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-
-        exchange_x_plane_cons(s, u_left, u_right);
 
         int q = 0;
         for (int k = 0; k < s->nz; ++k) {
@@ -529,6 +527,7 @@ static void compute_rhs(Solver *s) {
                 const int cL = idx3(s, 0, j, k);
                 const int cR = idx3(s, s->nx - 1, j, k);
                 const double n[3] = {1.0, 0.0, 0.0};
+                reconstruct_face_state(s, cL, n, s->dx[cL], -1, &send_left_face[q]);
                 viscous_flux_n(s, cL, n, &fv_left[q]);
                 viscous_flux_n(s, cR, n, &fv_right[q]);
                 q += NVAR;
@@ -538,6 +537,9 @@ static void compute_rhs(Solver *s) {
         const int left = (s->rank - 1 + s->nranks) % s->nranks;
         const int right = (s->rank + 1) % s->nranks;
         (void)left; (void)right;
+        MPI_Sendrecv(send_left_face, plane_n * NVAR, MPI_DOUBLE, left, 45,
+                     u_right, plane_n * NVAR, MPI_DOUBLE, right, 45,
+                     MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         MPI_Sendrecv(fv_left, plane_n * NVAR, MPI_DOUBLE, left, 50,
                      fv_right, plane_n * NVAR, MPI_DOUBLE, right, 50,
                      MPI_COMM_WORLD, MPI_STATUS_IGNORE);
@@ -553,8 +555,8 @@ static void compute_rhs(Solver *s) {
             }
         }
 
-        free(u_left);
         free(u_right);
+        free(send_left_face);
         free(fv_left);
         free(fv_right);
     }
@@ -596,7 +598,8 @@ static double compute_dt(const Solver *s) {
         const double sx = (fabs(u) + a) / s->dx[c];
         const double sy = (fabs(v) + a) / s->dy[c];
         const double sz = (fabs(w) + a) / s->dz[c];
-        const double dtc = s->cfl / (sx + sy + sz + 1e-12);
+        const double pscale = 2.0 * (double)s->p_order + 1.0;
+        const double dtc = s->cfl / (pscale * (sx + sy + sz + 1e-12));
         if (dtc < dt_local) dt_local = dtc;
     }
     double dt = dt_local;
@@ -656,7 +659,7 @@ static void advance_ssprk3(Solver *s, double dt) {
     free(u2);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     MPI_Init(NULL, NULL);
 
     Solver s;
@@ -678,6 +681,15 @@ int main(void) {
     s.mu = 2e-4;
     s.pr = 0.72;
     s.c_ip = 2.0;
+    s.p_order = 0;
+    if (argc > 1) {
+        s.p_order = atoi(argv[1]);
+    }
+    if (s.p_order < 0) s.p_order = 0;
+    if (s.p_order > 2) s.p_order = 2; /* current reconstruction supports up to linear; keep bounded */
+    if (s.rank == 0 && s.p_order > 1) {
+        printf("Note: p=%d uses linear face reconstruction with p-scaled CFL/penalty.\n", s.p_order);
+    }
     s.cfl = 0.25;
     s.t_final = 0.2;
     s.warp = 0.08;
@@ -695,7 +707,7 @@ int main(void) {
         t += dt;
         step++;
         if ((step % 25 == 0 || t >= s.t_final) && s.rank == 0) {
-            printf("step=%d t=%.6f dt=%.3e\n", step, t, dt);
+            printf("step=%d t=%.6f dt=%.3e p=%d\n", step, t, dt, s.p_order);
         }
     }
 
@@ -704,7 +716,7 @@ int main(void) {
     double mass = 0.0;
     MPI_Allreduce(&mass_local, &mass, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     if (s.rank == 0) {
-        printf("Done. local_cells=%d mpi_ranks=%d final_mass=%.12e\n", s.ncell, s.nranks, mass);
+        printf("Done. local_cells=%d mpi_ranks=%d p=%d final_mass=%.12e\n", s.ncell, s.nranks, s.p_order, mass);
     }
 
     free_solver(&s);
