@@ -77,6 +77,7 @@ typedef struct {
     double *gv;                /* size ncell*3 */
     double *gw;                /* size ncell*3 */
     double *gT;                /* size ncell*3 */
+    double *prho, *pu, *pv, *pw, *pT; /* primitive fields at cell centers */
 } Solver;
 
 static inline int idx3(const Solver *s, int i, int j, int k) {
@@ -157,9 +158,15 @@ static void alloc_solver(Solver *s) {
     s->gv = (double *)calloc(n * 3, sizeof(double));
     s->gw = (double *)calloc(n * 3, sizeof(double));
     s->gT = (double *)calloc(n * 3, sizeof(double));
+    s->prho = (double *)calloc(n, sizeof(double));
+    s->pu = (double *)calloc(n, sizeof(double));
+    s->pv = (double *)calloc(n, sizeof(double));
+    s->pw = (double *)calloc(n, sizeof(double));
+    s->pT = (double *)calloc(n, sizeof(double));
 
     if (!s->xc || !s->yc || !s->zc || !s->vol || !s->dx || !s->dy || !s->dz ||
-        !s->u || !s->rhs || !s->gu || !s->gv || !s->gw || !s->gT) {
+        !s->u || !s->rhs || !s->gu || !s->gv || !s->gw || !s->gT ||
+        !s->prho || !s->pu || !s->pv || !s->pw || !s->pT) {
         fprintf(stderr, "Allocation failure\n");
         exit(1);
     }
@@ -170,6 +177,7 @@ static void free_solver(Solver *s) {
     free(s->vol); free(s->dx); free(s->dy); free(s->dz);
     free(s->u); free(s->rhs);
     free(s->gu); free(s->gv); free(s->gw); free(s->gT);
+    free(s->prho); free(s->pu); free(s->pv); free(s->pw); free(s->pT);
 }
 
 static void build_mesh(Solver *s) {
@@ -237,25 +245,72 @@ static void prim_to_cons(const Solver *s, double rho, double u, double v, double
 }
 
 static void reconstruct_face_state(const Solver *s, int c, const double n[3], double h, int side, double Uface[NVAR]) {
-    double rho, u, v, w, p, T, a;
-    cons_to_prim(s, &s->u[c * NVAR], &rho, &u, &v, &w, &p, &T, &a);
-    (void)a;
+    int i = c % s->nx;
+    int j = (c / s->nx) % s->ny;
+    int k = c / (s->nx * s->ny);
 
-    const double alpha = (s->p_order <= 0) ? 0.0 : 1.0;
-    const double ds = 0.5 * h * (double)side;
-    const double dr = 0.0; /* keep density piecewise constant for robustness */
-    const double du = alpha * (s->gu[c * 3 + 0] * n[0] + s->gu[c * 3 + 1] * n[1] + s->gu[c * 3 + 2] * n[2]) * ds;
-    const double dv = alpha * (s->gv[c * 3 + 0] * n[0] + s->gv[c * 3 + 1] * n[1] + s->gv[c * 3 + 2] * n[2]) * ds;
-    const double dw = alpha * (s->gw[c * 3 + 0] * n[0] + s->gw[c * 3 + 1] * n[1] + s->gw[c * 3 + 2] * n[2]) * ds;
-    const double dT = alpha * (s->gT[c * 3 + 0] * n[0] + s->gT[c * 3 + 1] * n[1] + s->gT[c * 3 + 2] * n[2]) * ds;
+    int dir = 0;
+    if (fabs(n[1]) > fabs(n[dir])) dir = 1;
+    if (fabs(n[2]) > fabs(n[dir])) dir = 2;
 
-    const double rho_f = clamp_min(rho + dr, 1e-10);
-    const double u_f = u + du;
-    const double v_f = v + dv;
-    const double w_f = w + dw;
-    const double T_f = clamp_min(T + dT, 1e-10);
-    const double p_f = clamp_min(rho_f * T_f, 1e-10);
-    prim_to_cons(s, rho_f, u_f, v_f, w_f, p_f, Uface);
+    int p_eff = s->p_order;
+    if (s->nranks > 1 && dir == 0 && p_eff > 1) {
+        p_eff = 1; /* MPI path only exchanges one halo plane in x */
+    }
+
+    if (p_eff <= 0) {
+        const double rho = s->prho[c];
+        const double u = s->pu[c], v = s->pv[c], w = s->pw[c], T = s->pT[c];
+        const double p = clamp_min(rho * T, 1e-10);
+        prim_to_cons(s, rho, u, v, w, p, Uface);
+        return;
+    }
+
+    if (p_eff == 1) {
+        const double rho = s->prho[c];
+        const double u = s->pu[c], v = s->pv[c], w = s->pw[c], T = s->pT[c];
+        const double ds = 0.5 * h * (double)side;
+        const double du = (s->gu[c * 3 + 0] * n[0] + s->gu[c * 3 + 1] * n[1] + s->gu[c * 3 + 2] * n[2]) * ds;
+        const double dv = (s->gv[c * 3 + 0] * n[0] + s->gv[c * 3 + 1] * n[1] + s->gv[c * 3 + 2] * n[2]) * ds;
+        const double dw = (s->gw[c * 3 + 0] * n[0] + s->gw[c * 3 + 1] * n[1] + s->gw[c * 3 + 2] * n[2]) * ds;
+        const double dT = (s->gT[c * 3 + 0] * n[0] + s->gT[c * 3 + 1] * n[1] + s->gT[c * 3 + 2] * n[2]) * ds;
+        const double p = clamp_min(rho * clamp_min(T + dT, 1e-10), 1e-10);
+        prim_to_cons(s, rho, u + du, v + dv, w + dw, p, Uface);
+        return;
+    }
+
+    /* arbitrary-order (p>=2) face interpolation from cell-centered primitive values */
+    const double x_eval = 0.5 * (double)side;
+    const int npt = p_eff + 1;
+    const int start = -(npt / 2);
+    double rho_f = 0.0, u_f = 0.0, v_f = 0.0, w_f = 0.0, T_f = 0.0;
+    for (int a = 0; a < npt; ++a) {
+        const int off_a = start + a;
+        double xa = (double)off_a;
+        double la = 1.0;
+        for (int b = 0; b < npt; ++b) {
+            if (a == b) continue;
+            const int off_b = start + b;
+            const double xb = (double)off_b;
+            la *= (x_eval - xb) / (xa - xb);
+        }
+
+        int ii = i, jj = j, kk = k;
+        if (dir == 0) ii = (i + off_a + s->nx) % s->nx;
+        if (dir == 1) jj = (j + off_a + s->ny) % s->ny;
+        if (dir == 2) kk = (k + off_a + s->nz) % s->nz;
+        const int cs = idx3(s, ii, jj, kk);
+
+        rho_f += la * s->prho[cs];
+        u_f += la * s->pu[cs];
+        v_f += la * s->pv[cs];
+        w_f += la * s->pw[cs];
+        T_f += la * s->pT[cs];
+    }
+
+    rho_f = clamp_min(rho_f, 1e-10);
+    T_f = clamp_min(T_f, 1e-10);
+    prim_to_cons(s, rho_f, u_f, v_f, w_f, clamp_min(rho_f * T_f, 1e-10), Uface);
 }
 
 static void flux_inviscid_n(const Solver *s, const double U[NVAR], const double n[3], double Fn[NVAR]) {
@@ -293,19 +348,16 @@ static void numerical_flux_rusanov(const Solver *s, const double UL[NVAR], const
 
 static void compute_primitive_gradients(Solver *s) {
     const int ncell = s->ncell;
-    double *uu = (double *)malloc((size_t)ncell * sizeof(double));
-    double *vv = (double *)malloc((size_t)ncell * sizeof(double));
-    double *ww = (double *)malloc((size_t)ncell * sizeof(double));
-    double *TT = (double *)malloc((size_t)ncell * sizeof(double));
-    if (!uu || !vv || !ww || !TT) {
-        fprintf(stderr, "Gradient temporary allocation failure\n");
-        free(uu); free(vv); free(ww); free(TT);
-        exit(1);
-    }
+    double *uu = s->pu;
+    double *vv = s->pv;
+    double *ww = s->pw;
+    double *TT = s->pT;
+    double *rr = s->prho;
 
     for (int c = 0; c < ncell; ++c) {
         double rho, u, v, w, p, T, a;
         cons_to_prim(s, &s->u[c * NVAR], &rho, &u, &v, &w, &p, &T, &a);
+        rr[c] = rho;
         uu[c] = u;
         vv[c] = v;
         ww[c] = w;
@@ -382,10 +434,6 @@ static void compute_primitive_gradients(Solver *s) {
         }
     }
 
-    free(uu);
-    free(vv);
-    free(ww);
-    free(TT);
     free(uu_left); free(uu_right);
     free(vv_left); free(vv_right);
     free(ww_left); free(ww_right);
@@ -686,9 +734,8 @@ int main(int argc, char **argv) {
         s.p_order = atoi(argv[1]);
     }
     if (s.p_order < 0) s.p_order = 0;
-    if (s.p_order > 2) s.p_order = 2; /* current reconstruction supports up to linear; keep bounded */
-    if (s.rank == 0 && s.p_order > 1) {
-        printf("Note: p=%d uses linear face reconstruction with p-scaled CFL/penalty.\n", s.p_order);
+    if (s.rank == 0 && s.nranks > 1 && s.p_order > 1) {
+        printf("Note: with MPI x-decomposition, p>1 in x-direction currently falls back to first-order x-face reconstruction.\n");
     }
     s.cfl = 0.25;
     s.t_final = 0.2;
